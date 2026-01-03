@@ -1,0 +1,3 @@
+# 忽略python缓存
+__pycache__/
+
