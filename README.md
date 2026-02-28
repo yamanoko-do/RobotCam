@@ -1,5 +1,7 @@
 用于内参标定，手在眼外，双目外参标定，极线校正的存储库
 
+# 关于分支，累积小的提交，最后合并进入主分支
+
 - 克隆存储库：
 ```
 GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/yamanoko-do/RobotCam.git --recurse-submodules

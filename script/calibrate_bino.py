@@ -1,3 +1,5 @@
+import sys
+sys.path.insert(0, '.')
 import os
 import cv2
 from hardware.camera.binocam import BinocularCam
