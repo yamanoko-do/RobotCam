@@ -91,7 +91,7 @@ def calibrate_intrinsic(chessboard_glob_pattern: str, chessboard_size: Tuple[int
     if not objpoints:
         raise RuntimeError("未找到任何有效的棋盘格图像用于标定！")
 
-    print(f"成功检测 {len(objpoints)} 张图像的角点，开始标定...")
+    print(f"\n成功检测 {len(objpoints)} 张图像的角点，开始标定内参...")
     
     # 执行标定（注意：resolution[::-1] 是 (width, height)）
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
@@ -101,7 +101,7 @@ def calibrate_intrinsic(chessboard_glob_pattern: str, chessboard_size: Tuple[int
     print(f"重投影误差{ret},单位为像素,应小于1")#重投影误差：把三维点再投影回图像，看看计算出来的像素位置与真实检测位置差多少
     print("相机内参矩阵 (Intrinsic Camera Matrix):")
     print(mtx.tolist())
-    print("\n畸变系数 (Distortion Coefficients):")
+    print("畸变系数 (Distortion Coefficients):")
     print(dist.ravel().tolist())
     #dist=np.zeros((5, 1))
 

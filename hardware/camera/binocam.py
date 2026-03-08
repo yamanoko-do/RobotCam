@@ -4,15 +4,13 @@ import os
 import glob
 import cv2
 import numpy as np
-import math
-from hardware.camera.basecamera import BaseCamera
 
 
-class BinocularCam(BaseCamera):
+class BinocularCam():
     """
     仅在linux上可正常使用该相机
     """
-    def __init__(self, device_id=None, vid_pid="1bcf:0b15"):
+    def __init__(self, device_id=None, vid_pid="1bcf:0b15", map_dir=None):
         """
         初始化双目摄像头
         Args:
@@ -39,6 +37,16 @@ class BinocularCam(BaseCamera):
                 "  device_id  → 可用命令查看：v4l2-ctl --list-devices\n"
                 "  或 vid_pid → 可用命令查看：lsusb"
             )
+        
+        self.map1x = None
+        self.map1y = None
+        self.map2x = None
+        self.map2y = None
+        if map_dir is not None:
+            self._load_rectify_maps(map_dir)
+            print(f"[INFO] 已加载校正映射表")
+        else:
+            print("[WARNING] 未提供校正映射表目录，无法使用 get_rectifyframe() 方法")
 
         # 打开视频流
         print(device_id)
@@ -76,7 +84,66 @@ class BinocularCam(BaseCamera):
             'binocular': frame
         }
 
-
+    def get_rectifyframe(self, interpolation=cv2.INTER_LINEAR):
+        """
+        获取校正后的双目图像帧
+        Args:
+            interpolation (int): 插值方法，可选值：
+                - cv2.INTER_NEAREST: 最近邻插值
+                - cv2.INTER_LINEAR: 双线性插值（默认）
+                - cv2.INTER_CUBIC: 双三次插值
+                - cv2.INTER_AREA: 区域插值
+                - cv2.INTER_LANCZOS4: Lanczos插值
+        Returns:
+            dict: {'left': rectL, 'right': rectR, 'binocular': rect_frame}
+                rectL: 校正后的左目图像
+                rectR: 校正后的右目图像
+                rect_frame: 校正后的双目拼接图像
+        """
+        # 获取原始帧
+        raw_frames = self.get_frame()
+        imgL = raw_frames['left']
+        imgR = raw_frames['right']
+        
+        # 执行图像校正
+        rectL = cv2.remap(imgL, self.map1x, self.map1y, interpolation=interpolation)
+        rectR = cv2.remap(imgR, self.map2x, self.map2y, interpolation=interpolation)
+        
+        # 拼接校正后的双目图像
+        rect_frame = np.hstack((rectL, rectR))
+        
+        return {
+            'left': rectL,
+            'right': rectR,
+            'binocular': rect_frame
+        }
+    
+    def _load_rectify_maps(self, map_dir=None):
+        """
+        加载双目校正映射表
+        """
+        map_paths = {
+            'map1x': f"{map_dir}/map1x.npy",
+            'map1y': f"{map_dir}/map1y.npy",
+            'map2x': f"{map_dir}/map2x.npy",
+            'map2y': f"{map_dir}/map2y.npy"
+        }
+        
+        # 检查文件是否存在
+        for name, path in map_paths.items():
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"校正映射表文件不存在: {path}")
+        
+        # 加载映射表
+        try:
+            self.map1x = np.load(map_paths['map1x'])
+            self.map1y = np.load(map_paths['map1y'])
+            self.map2x = np.load(map_paths['map2x'])
+            self.map2y = np.load(map_paths['map2y'])
+            print(f"[INFO] 成功加载双目校正映射表")
+        except Exception as e:
+            raise RuntimeError(f"加载校正映射表失败: {str(e)}")
+        
     def adjust_focus_assistant(self, window_name="Focus Assistant", history_size=10):
         """
         调焦辅助工具：实时显示左右眼清晰度，帮助精确调焦
@@ -288,30 +355,6 @@ class BinocularCam(BaseCamera):
             print("\n用户中断PnP检测模式")
         finally:
             cv2.destroyWindow(window_name)
-
-    @staticmethod
-    def get_intrinsics():
-        """
-        获取相机内参和畸变系数
-        """
-        # 左目相机内参矩阵
-        mtx_left = np.array([[667.9168283725817, 0.0, 614.6288637957155], [0.0, 668.0460497679354, 346.0298183178211], [0.0, 0.0, 1.0]])
-        
-        # 左目相机畸变系数
-        dist_left = np.array([-0.047259990825834194, -0.04440804570994635, -0.00030253164833697464, -0.000526020240064694, 0.042117973320535])
-        dist_left = np.zeros((5, 1))
-        # 右目相机内参矩阵
-        mtx_right = np.array([[664.8425044613646, 0.0, 637.8140118078181], [0.0, 665.1471198265182, 352.7132595594718], [0.0, 0.0, 1.0]])
-        
-        # 右目相机畸变系数
-        dist_right = np.array([-0.049725137737477484, -0.04598226254568722, 0.00027690607890856793, -1.8089702791640458e-05, 0.046316177986347636])
-        dist_right = np.zeros((5, 1))
-        return {
-            'mtx_left': mtx_left,
-            'dist_left': dist_left,
-            'mtx_right': mtx_right,
-            'dist_right': dist_right
-        }
 
     @staticmethod
     def _find_video_device(vid_pid):

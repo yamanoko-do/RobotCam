@@ -4,38 +4,41 @@ import cv2
 import open3d as o3d
 import time
 from typing import Tuple
+import os
+import glob
 
 class CameraD435:
     def __init__(self):
-        """
-        初始化
-        """
         self.pipeline = rs.pipeline()
         self.config = rs.config()
-        self.color_frame_enable=False
-        self.depth_frame_enable=False
-        self.pc = rs.pointcloud()# 创建相机点云对象，用于后续对齐深度和彩色
-        self.align = rs.align(rs.stream.color)#创建对其对象，对齐到color坐标
-        self.enable_stream(rs.stream.color, 1280,720, rs.format.bgr8, 30)
-        self.start()
+        self.color_frame_enable = False
+        self.depth_frame_enable = False
+        self.pc = rs.pointcloud()
+        self.align = rs.align(rs.stream.color)
+        self._started = False  # 新增状态标志
 
-    def enable_stream(self,stream_type,width,height,format,framerate):
-        if str(stream_type)=="stream.color":
-            self.color_frame_enable=True
-        elif str(stream_type)=="stream.depth":
-            self.depth_frame_enable=True
-
-        self.config.enable_stream(stream_type,width,height,format,framerate)
+    def enable_stream(self, stream_type, width, height, format, framerate):
+        if self._started:
+            raise RuntimeError("Cannot enable stream after pipeline started. Call enable_stream() before start().")
+        if str(stream_type) == "stream.color":
+            self.color_frame_enable = True
+        elif str(stream_type) == "stream.depth":
+            self.depth_frame_enable = True
+        self.config.enable_stream(stream_type, width, height, format, framerate)
 
 
     def start(self):
-        # 启动数据流
+        if self._started:
+            print("Pipeline already started.")
+            return
         self.pipeline.start(self.config)
+        self._started = True
 
     
     def stop(self):
-        # 关闭数据流
-        self.pipeline.stop()
+        if self._started:
+            self.pipeline.stop()
+            self._started = False
 
     def get_frame(self,format2numpy=True)-> dict:
         frames = self.pipeline.wait_for_frames()
@@ -102,7 +105,58 @@ class CameraD435:
             colors = color_image[v, u] / 255.0  # 归一化到[0,1]
             return verts,colors
     
+    def take_photo(self, save_dir="./data/chessboard_images/monocular"):
+        """
+        启动实时预览，按 's' 保存彩色图像，按 'q' 或 ESC 退出。
+        Args:
+            save_dir (str): 保存图像的目录路径
+        """
+        # 创建保存目录
+        os.makedirs(save_dir, exist_ok=True)
 
+        # 确定起始编号（基于已存在的 image_*.jpg）
+        photo_count = 1
+        existing_files = glob.glob(os.path.join(save_dir, "image_*.jpg"))
+        if existing_files:
+            max_num = 0
+            for file_path in existing_files:
+                try:
+                    filename = os.path.splitext(os.path.basename(file_path))[0]
+                    number = int(filename.split('_')[-1])
+                    if number > max_num:
+                        max_num = number
+                except (ValueError, IndexError):
+                    continue
+            photo_count = max_num + 1
+
+        print("D435相机预览中... 按 's' 保存图像，按 'q' 或 ESC 退出。")
+        try:
+            while True:
+                # 获取彩色帧
+                frame_dict = self.get_frame()
+                if "color" not in frame_dict:
+                    print("未获取到彩色帧")
+                    continue
+                color_frame = frame_dict["color"]
+
+                # 显示预览
+                cv2.imshow('D435 Camera - Press s to save, q/ESC to quit', color_frame)
+                key = cv2.waitKey(1) & 0xFF
+
+                # 按's'保存图片
+                if key == ord('s'):
+                    save_path = os.path.join(save_dir, f"image_{photo_count}.jpg")
+                    cv2.imwrite(save_path, color_frame)
+                    print(f"已保存: {save_path}")
+                    photo_count += 1
+
+                # 按'q'或ESC退出
+                elif key in (ord('q'), 27):
+                    break
+
+        finally:
+            # 清理窗口
+            cv2.destroyAllWindows()
 
     #获取支持的流参数
     @staticmethod
@@ -180,8 +234,8 @@ class CameraD435:
         config = rs.config()
         
         # 启用深度和彩色流
-        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        config.enable_stream(rs.stream.color, 1280,720, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, 1280,720, rs.format.z16, 30)
 
         # 启动设备
         pipeline.start(config)
@@ -205,7 +259,7 @@ if __name__=="__main__":
     """
     获取支持的流配置参数
     """
-    #CameraD435.get_support_config()
+    CameraD435.get_support_config()
 
     """
     输出rgb流
@@ -229,7 +283,7 @@ if __name__=="__main__":
     输出depth流
     """
     # cam=CameraD435()
-    # cam.enable_stream(rs.stream.depth, 640,480, rs.format.z16, 30)
+    # cam.enable_stream(rs.stream.depth, 1280,720, rs.format.z16, 30)
     # cam.start()
     # try:
     #     while True:
@@ -247,8 +301,11 @@ if __name__=="__main__":
     """
     使用open3d渲染实时点云
     """
+    os.environ["XDG_SESSION_TYPE"] = "x11"
+    os.environ["__NV_PRIME_RENDER_OFFLOAD"] = "1"
+    os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
     cam=CameraD435()
-    cam.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    cam.enable_stream(rs.stream.depth, 1280,720, rs.format.z16, 30)
     cam.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
     cam.start()
     # 创建Open3D可视化窗口
@@ -294,7 +351,7 @@ if __name__=="__main__":
 
 
     # cam = CameraD435()
-    # cam.enable_stream(rs.stream.depth,  1280,  720, rs.format.z16, 6)
+    # cam.enable_stream(rs.stream.depth,  1280,  720, rs.format.z16, 30)
     # cam.enable_stream(rs.stream.color,  1280,  720, rs.format.bgr8, 30)
     # cam.start()
     # # Create mouse event
@@ -319,5 +376,3 @@ if __name__=="__main__":
     #     if key == 27:
     #         cam.stop()
     #         break
-
-
