@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from scipy.stats import ttest_ind
 from hardware.camera.binocam import BinocularCam
-
+from hardware.camera.d435 import CameraD435
 def compute_pixel_variance_gpu():
     # 参数设置
     num_frames = 1000          # 总帧数
@@ -30,6 +30,10 @@ def compute_pixel_variance_gpu():
     # ------------------- 采集帧 -------------------
     print("初始化相机...")
     cam = BinocularCam(map_dir="./data/output")
+    # import pyrealsense2 as rs
+    # cam = CameraD435()
+    # cam.enable_stream(rs.stream.color, 1280,720, rs.format.bgr8, 30)
+    # cam.start()
 
     frames_cpu = []             # 在 CPU 内存中保留所有帧 (归一化 float32)
     print("采集图像...")
