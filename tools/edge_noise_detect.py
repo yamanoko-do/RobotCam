@@ -29,7 +29,7 @@ def compute_pixel_variance_gpu():
 
     # ------------------- 采集帧 -------------------
     print("初始化相机...")
-    cam = BinocularCam(map_dir="./data/output")
+    cam = BinocularCam(vid_pid="1bcf:0b15",map_dir="./data/output")
     # import pyrealsense2 as rs
     # cam = CameraD435()
     # cam.enable_stream(rs.stream.color, 1280,720, rs.format.bgr8, 30)

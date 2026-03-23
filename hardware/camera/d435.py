@@ -187,12 +187,12 @@ class CameraD435:
         config = rs.config()
         
         # 启用深度和彩色流
-        config.enable_stream(rs.stream.color, 1280,720, rs.format.bgr8, 30)
-        #config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        # config.enable_stream(rs.stream.color, 1280,720, rs.format.bgr8, 30)
+        # #config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        # config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
         # 启动设备
-        pipeline.start(config)
+        #pipeline.start(config)
         profile = pipeline.get_active_profile()
 
         # 获取彩色和深度相机的内参

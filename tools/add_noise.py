@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import os
 
 def add_region_based_noise(image, edge_mean=0, edge_var=0.002,
-                           nonedge_mean=0, nonedge_var=0.0001,
+                           nonedge_mean=0, nonedge_var=0.0005,
                            edge_threshold=0.2):
     """
     对图像添加区域相关的高斯噪声。
@@ -60,7 +60,7 @@ def add_region_based_noise(image, edge_mean=0, edge_var=0.002,
 
 def main():
     # 图像路径
-    img_path = os.path.expanduser("~/docker_share/dataset/test_image/left_0_rectified.jpg")
+    img_path = os.path.expanduser("~/docker_share/dataset/test_image/left_1_rectified.jpg")
     if not os.path.exists(img_path):
         print(f"图像文件不存在: {img_path}")
         return

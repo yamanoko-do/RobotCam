@@ -24,14 +24,14 @@ os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
 
 def capture_and_visualize():
     # --- 1. 参数设置 ---
-    num_frames = 1000
+    num_frames = 100
     scale = 1000.0
     playback_speed = 0.03
     downsample_rate = 4
 
     # --- 2. 数据采集 ---
     print(f"正在初始化相机并采集 {num_frames} 帧图像...")
-    cam = BinocularCam(map_dir="./data/output")
+    cam = BinocularCam(vid_pid="0211:5838",map_dir="./data/output")
     
     frame_list = []
     for i in range(num_frames):
