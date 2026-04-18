@@ -4,6 +4,16 @@ import os
 import glob
 import numpy as np
 import time
+import sys
+import threading
+
+try:
+    import moderngl
+    import glfw
+except ImportError:
+    print("[ERROR] ModernGL/GLFW 未安装")
+    print("        安装: conda install -c conda-forge moderngl glfw")
+    sys.exit(1)
 
 
 class ZEDUVC:
@@ -227,26 +237,35 @@ class ZEDUVC:
                     continue
             photo_count = max_num + 1
 
+        width, height = self.RESOLUTIONS[self.resolution_name]
         print(f"ZED UVC 相机预览中 ({self.resolution_name})... 按 's' 保存图像，按 'q' 或 ESC 退出。")
+
+        display = ModernGLDisplay(width, height, "ZED UVC Camera - Press s to save, q/ESC to quit")
+
         try:
             while True:
                 frames = self.get_frame()
-                cv2.imshow('ZED UVC Camera - Press s to save, q/ESC to quit', frames['binocular'])
-                key = cv2.waitKey(1) & 0xFF
 
-                if key == ord('s'):
-                    left_path = os.path.join(save_dir, f"left_{photo_count}.jpg")
-                    right_path = os.path.join(save_dir, f"right_{photo_count}.jpg")
-                    cv2.imwrite(left_path, frames['left'])
-                    cv2.imwrite(right_path, frames['right'])
-                    print(f"已保存: {left_path} | {right_path}")
-                    photo_count += 1
+                display.update(frames['binocular'])
+                display.render()
 
-                elif key in (ord('q'), 27):
+                # 检查按键
+                for key in display.get_pressed_keys():
+                    if key == glfw.KEY_S:
+                        left_path = os.path.join(save_dir, f"left_{photo_count}.jpg")
+                        right_path = os.path.join(save_dir, f"right_{photo_count}.jpg")
+                        cv2.imwrite(left_path, frames['left'])
+                        cv2.imwrite(right_path, frames['right'])
+                        print(f"已保存: {left_path} | {right_path}")
+                        photo_count += 1
+                    elif key in (glfw.KEY_Q, glfw.KEY_ESCAPE):
+                        return
+
+                if display.should_close():
                     break
 
         finally:
-            cv2.destroyAllWindows()
+            display.close()
 
     def stop(self):
         """释放摄像头资源"""
@@ -280,6 +299,133 @@ class ZEDUVC:
         for name, (w, h) in ZEDUVC.RESOLUTIONS.items():
             single_w = w // 2
             print(f"  {name}: {single_w}x{h} (单目) | {w}x{h} (合并)")
+
+
+
+
+class ModernGLDisplay:
+    """高性能 ModernGL 显示器用于 ZED 相机"""
+
+    # 顶点着色器
+    _vertex_shader = """
+    #version 330
+    in vec2 in_vert;
+    in vec2 in_text;
+    out vec2 v_text;
+    void main() {
+        gl_Position = vec4(in_vert, 0.0, 1.0);
+        v_text = in_text;
+    }
+    """
+
+    # 片段着色器（BGR to RGB 转换）
+    _fragment_shader = """
+    #version 330
+    uniform sampler2D Texture;
+    in vec2 v_text;
+    out vec4 f_color;
+    void main() {
+        vec3 color = texture(Texture, v_text).rgb;
+        // OpenCV 是 BGR，交换为 RGB
+        color = color.bgr;
+        f_color = vec4(color, 1.0);
+    }
+    """
+
+    def __init__(self, width=2560, height=720, title="ZED UVC Camera"):
+        self.width = width
+        self.height = height
+        self._initialized = False
+
+        # 初始化 GLFW
+        if not glfw.init():
+            raise RuntimeError("无法初始化 GLFW")
+
+        # 创建窗口
+        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+
+        self.window = glfw.create_window(width, height, title, None, None)
+        if not self.window:
+            glfw.terminate()
+            raise RuntimeError("无法创建 GLFW 窗口")
+
+        glfw.make_context_current(self.window)
+
+        # 创建 ModernGL 上下文
+        self.ctx = moderngl.create_context()
+
+        # 创建着色器程序
+        self.prog = self.ctx.program(
+            vertex_shader=self._vertex_shader,
+            fragment_shader=self._fragment_shader
+        )
+
+        # 全屏四边形顶点
+        vertices = np.array([
+            -1.0, -1.0, 0.0, 1.0,
+             1.0, -1.0, 1.0, 1.0,
+            -1.0,  1.0, 0.0, 0.0,
+             1.0,  1.0, 1.0, 0.0,
+        ], dtype=np.float32)
+
+        self.vbo = self.ctx.buffer(vertices)
+        self.vao = self.ctx.vertex_array(
+            self.prog,
+            [(self.vbo, '2f 2f', 'in_vert', 'in_text')]
+        )
+
+        # 创建纹理
+        self.texture = self.ctx.texture((width, height), 3)
+        self.texture.use()
+
+        self._key_callback = None
+        self._saved_keys = []
+        glfw.set_key_callback(self.window, self._on_key)
+        self._initialized = True
+
+    def _on_key(self, window, key, scancode, action, mods):
+        """内部键盘回调"""
+        if action == glfw.PRESS:
+            self._saved_keys.append(key)
+
+    def get_pressed_keys(self):
+        """获取并清除已按下的键列表"""
+        keys = self._saved_keys.copy()
+        self._saved_keys.clear()
+        return keys
+
+    def update(self, image):
+        """更新纹理图像 (H, W, 3) BGR 格式"""
+        self.texture.write(image.tobytes())
+
+    def render(self):
+        """渲染一帧"""
+        self.ctx.clear(0.0, 0.0, 0.0)
+        self.vao.render(moderngl.TRIANGLE_STRIP)
+        glfw.swap_buffers(self.window)
+        glfw.poll_events()
+
+    def should_close(self):
+        return glfw.window_should_close(self.window)
+
+    def close(self):
+        """关闭窗口并释放资源"""
+        if not self._initialized:
+            return
+        self.vao.release()
+        self.vbo.release()
+        self.texture.release()
+        self.prog.release()
+        self.ctx.release()
+        glfw.destroy_window(self.window)
+        glfw.terminate()
+        self._initialized = False
+
+    def __del__(self):
+        self.close()
+
 
     @staticmethod
     def probe_device(device_id=0):
@@ -429,38 +575,110 @@ def test_performance(resolution='VGA', device_id=None):
                 print(f"达到理论值: {fps/target_fps*100:.1f}%")
                 break
 
-        # 测试3: 显示
+        # 测试3: 显示 - 使用多线程分离捕获和显示
         print(f"\n{'='*60}")
         print("测试3: 实时显示 (按 'q' 退出)")
         print(f"{'='*60}")
-        frame_count = 0
-        fps_start = time.time()
-        current_fps = 0
+        width, height = cam.RESOLUTIONS[resolution]
 
-        while True:
-            frames = cam.get_frame()
-            frame_count += 1
+        # 共享数据和锁
+        latest_frame = None
+        latest_frame_lock = threading.Lock()
+        current_capture_fps = 0
+        current_display_fps = 0
+        current_capture_ms = 0
+        current_display_ms = 0
+        stopped = False
 
-            elapsed = time.time() - fps_start
-            if elapsed >= 0.5:
-                current_fps = frame_count / elapsed
-                frame_count = 0
-                fps_start = time.time()
+        # 捕获线程函数
+        def capture_thread():
+            nonlocal latest_frame, stopped, current_capture_fps, current_capture_ms
+            capture_count = 0
+            capture_time_total = 0.0
+            fps_start = time.time()
 
-            display = frames['binocular'].copy()
-            cv2.putText(display, f"FPS: {current_fps:.1f} / {target_fps}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(display, f"Res: {resolution}", (10, 70),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.imshow("ZED UVC", display)
+            while not stopped:
+                t0 = time.time()
+                frames = cam.get_frame()
+                t1 = time.time()
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
+                # 更新最新帧
+                with latest_frame_lock:
+                    latest_frame = frames.copy()
+
+                capture_count += 1
+                capture_time_total += (t1 - t0)
+
+                # 统计捕获 FPS
+                elapsed = time.time() - fps_start
+                if elapsed >= 0.5:
+                    current_capture_fps = capture_count / elapsed
+                    current_capture_ms = (capture_time_total / capture_count) * 1000 if capture_count > 0 else 0
+                    capture_count = 0
+                    capture_time_total = 0.0
+                    fps_start = time.time()
+
+        # 使用 ModernGL 显示
+        display = ModernGLDisplay(width, height, "ZED UVC")
+        print("[INFO] 使用 ModernGL 显示 (多线程)")
+
+        # 启动捕获线程
+        cap_thread = threading.Thread(target=capture_thread, daemon=True)
+        cap_thread.start()
+
+        try:
+            display_count = 0
+            display_time_total = 0.0
+            fps_start = time.time()
+
+            while True:
+                # 获取最新帧
+                frame_to_show = None
+                with latest_frame_lock:
+                    if latest_frame is not None:
+                        frame_to_show = latest_frame
+
+                if frame_to_show is not None:
+                    # 显示帧
+                    display_img = frame_to_show['binocular'].copy()
+                    cv2.putText(display_img, f"Capture: {current_capture_fps:.1f} ({current_capture_ms:.1f}ms) | Display: {current_display_fps:.1f} ({current_display_ms:.1f}ms)", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(display_img, f"Res: {resolution} | Target: {target_fps}", (10, 70),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+                    t0 = time.time()
+                    display.update(display_img)
+                    display.render()
+                    t1 = time.time()
+
+                    display_count += 1
+                    display_time_total += (t1 - t0)
+
+                # 统计显示 FPS
+                elapsed = time.time() - fps_start
+                if elapsed >= 0.5:
+                    current_display_fps = display_count / elapsed
+                    current_display_ms = (display_time_total / display_count) * 1000 if display_count > 0 else 0
+                    display_count = 0
+                    display_time_total = 0.0
+                    fps_start = time.time()
+
+                # 检查按键
+                for key in display.get_pressed_keys():
+                    if key in (glfw.KEY_Q, glfw.KEY_ESCAPE):
+                        stopped = True
+                        break
+                else:
+                    if not display.should_close():
+                        continue
                 break
+        finally:
+            stopped = True
+            cap_thread.join(timeout=1.0)
+            display.close()
 
     finally:
         cam.stop()
-        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

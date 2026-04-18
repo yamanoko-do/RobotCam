@@ -8,6 +8,15 @@ import time
 from typing import Tuple
 import os
 import glob
+import threading
+
+try:
+    import moderngl
+    import glfw
+except ImportError:
+    print("[ERROR] ModernGL/GLFW 未安装")
+    print("        安装: conda install -c conda-forge moderngl glfw")
+    sys.exit(1)
 
 
 class CameraZED:
@@ -37,7 +46,6 @@ class CameraZED:
             (2208, 1242): sl.RESOLUTION.HD2K,
             (1920, 1080): sl.RESOLUTION.HD1080,
             (1280, 720): sl.RESOLUTION.HD720,
-            (960, 600): sl.RESOLUTION.SVGA,
             (672, 376): sl.RESOLUTION.VGA
         }
 
@@ -282,7 +290,6 @@ class CameraZED:
             sl.RESOLUTION.HD2K: "HD2K (2208x1242)",
             sl.RESOLUTION.HD1080: "HD1080 (1920x1080)",
             sl.RESOLUTION.HD720: "HD720 (1280x720)",
-            sl.RESOLUTION.SVGA: "SVGA (960x600)",
             sl.RESOLUTION.VGA: "VGA (672x376)"
         }
         return res_map.get(self.current_resolution, "Unknown")
@@ -317,7 +324,6 @@ class CameraZED:
             'HD2K': (2208, 1242),
             'HD1080': (1920, 1080),
             'HD720': (1280, 720),
-            'SVGA': (960, 600),
             'VGA': (672, 376)
         }
 
@@ -477,7 +483,7 @@ class CameraZED:
         启动实时预览，按 's' 保存图像，按 'q' 或 ESC 退出
         Args:
             save_dir (str): 保存图像的目录路径
-            resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA')
+            resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'VGA')
         """
         if not self._started:
             # 分辨率配置
@@ -485,7 +491,6 @@ class CameraZED:
                 'HD2K': (2208, 1242, 15),
                 'HD1080': (1920, 1080, 30),
                 'HD720': (1280, 720, 60),
-                'SVGA': (960, 600, 100),
                 'VGA': (672, 376, 100)
             }
             if resolution not in res_config:
@@ -535,6 +540,133 @@ class CameraZED:
         finally:
             cv2.destroyAllWindows()
 
+
+
+
+class ModernGLDisplay:
+    """高性能 ModernGL 显示器用于 ZED 相机"""
+
+    # 顶点着色器
+    _vertex_shader = """
+    #version 330
+    in vec2 in_vert;
+    in vec2 in_text;
+    out vec2 v_text;
+    void main() {
+        gl_Position = vec4(in_vert, 0.0, 1.0);
+        v_text = in_text;
+    }
+    """
+
+    # 片段着色器（BGR to RGB 转换）
+    _fragment_shader = """
+    #version 330
+    uniform sampler2D Texture;
+    in vec2 v_text;
+    out vec4 f_color;
+    void main() {
+        vec3 color = texture(Texture, v_text).rgb;
+        // OpenCV 是 BGR，交换为 RGB
+        color = color.bgr;
+        f_color = vec4(color, 1.0);
+    }
+    """
+
+    def __init__(self, width=1280, height=720, title="ZED Camera"):
+        self.width = width
+        self.height = height
+        self._initialized = False
+
+        # 初始化 GLFW
+        if not glfw.init():
+            raise RuntimeError("无法初始化 GLFW")
+
+        # 创建窗口
+        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+
+        self.window = glfw.create_window(width, height, title, None, None)
+        if not self.window:
+            glfw.terminate()
+            raise RuntimeError("无法创建 GLFW 窗口")
+
+        glfw.make_context_current(self.window)
+
+        # 创建 ModernGL 上下文
+        self.ctx = moderngl.create_context()
+
+        # 创建着色器程序
+        self.prog = self.ctx.program(
+            vertex_shader=self._vertex_shader,
+            fragment_shader=self._fragment_shader
+        )
+
+        # 全屏四边形顶点
+        vertices = np.array([
+            -1.0, -1.0, 0.0, 1.0,
+             1.0, -1.0, 1.0, 1.0,
+            -1.0,  1.0, 0.0, 0.0,
+             1.0,  1.0, 1.0, 0.0,
+        ], dtype=np.float32)
+
+        self.vbo = self.ctx.buffer(vertices)
+        self.vao = self.ctx.vertex_array(
+            self.prog,
+            [(self.vbo, '2f 2f', 'in_vert', 'in_text')]
+        )
+
+        # 创建纹理
+        self.texture = self.ctx.texture((width, height), 3)
+        self.texture.use()
+
+        self._key_callback = None
+        self._saved_keys = []
+        glfw.set_key_callback(self.window, self._on_key)
+        self._initialized = True
+
+    def _on_key(self, window, key, scancode, action, mods):
+        """内部键盘回调"""
+        if action == glfw.PRESS:
+            self._saved_keys.append(key)
+
+    def get_pressed_keys(self):
+        """获取并清除已按下的键列表"""
+        keys = self._saved_keys.copy()
+        self._saved_keys.clear()
+        return keys
+
+    def update(self, image):
+        """更新纹理图像 (H, W, 3) BGR 格式"""
+        self.texture.write(image.tobytes())
+
+    def render(self):
+        """渲染一帧"""
+        self.ctx.clear(0.0, 0.0, 0.0)
+        self.vao.render(moderngl.TRIANGLE_STRIP)
+        glfw.swap_buffers(self.window)
+        glfw.poll_events()
+
+    def should_close(self):
+        return glfw.window_should_close(self.window)
+
+    def close(self):
+        """关闭窗口并释放资源"""
+        if not self._initialized:
+            return
+        self.vao.release()
+        self.vbo.release()
+        self.texture.release()
+        self.prog.release()
+        self.ctx.release()
+        glfw.destroy_window(self.window)
+        glfw.terminate()
+        self._initialized = False
+
+    def __del__(self):
+        self.close()
+
+
     @staticmethod
     def get_support_config():
         """打印支持的分辨率配置"""
@@ -542,7 +674,6 @@ class CameraZED:
         print("  HD2K: 2208x1242")
         print("  HD1080: 1920x1080")
         print("  HD720: 1280x720")
-        print("  SVGA: 960x600")
         print("  VGA: 672x376")
         print("支持的流类型: left, right, depth")
 
@@ -556,7 +687,6 @@ def test_generate_rectify_maps():
         ('HD2K', 2208, 1242, 15),
         ('HD1080', 1920, 1080, 30),
         ('HD720', 1280, 720, 60),
-        ('SVGA', 960, 600, 100),
         ('VGA', 672, 376, 100)
     ]
 
@@ -604,7 +734,7 @@ def test_basic_camera(resolution='HD720'):
     """测试：基本相机功能 - 显示左右图和深度图
 
     Args:
-        resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA')
+        resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'VGA')
     """
     print("=== 测试 ZED 基本相机功能 ===\n")
 
@@ -613,7 +743,6 @@ def test_basic_camera(resolution='HD720'):
         'HD2K': (2208, 1242, 15),
         'HD1080': (1920, 1080, 30),
         'HD720': (1280, 720, 60),
-        'SVGA': (960, 600, 100),
         'VGA': (672, 376, 100)
     }
 
@@ -692,7 +821,7 @@ def test_point_cloud(resolution='HD720'):
     """测试：使用 Open3D 渲染点云
 
     Args:
-        resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA')
+        resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'VGA')
     """
     print("=== 测试 ZED 点云渲染 ===\n")
 
@@ -701,7 +830,6 @@ def test_point_cloud(resolution='HD720'):
         'HD2K': (2208, 1242, 15),
         'HD1080': (1920, 1080, 30),
         'HD720': (1280, 720, 60),
-        'SVGA': (960, 600, 100),
         'VGA': (672, 376, 100)
     }
 
@@ -765,7 +893,7 @@ def test_take_photo(resolution='HD720'):
     """测试：拍摄单目照片
 
     Args:
-        resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA')
+        resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'VGA')
     """
     print("=== 测试 ZED 拍摄照片 ===\n")
 
@@ -777,7 +905,7 @@ def test_rgb_only(resolution='HD720'):
     """测试：仅RGB左图性能测试（无深度计算，最大FPS）
 
     Args:
-        resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA')
+        resolution: 分辨率选项 ('HD2K', 'HD1080', 'HD720', 'VGA')
     """
     print("=== 测试 ZED RGB-only 性能 ===\n")
 
@@ -786,7 +914,6 @@ def test_rgb_only(resolution='HD720'):
         'HD2K': (2208, 1242, 15),
         'HD1080': (1920, 1080, 30),
         'HD720': (1280, 720, 60),
-        'SVGA': (960, 600, 100),
         'VGA': (672, 376, 100)
     }
 
@@ -907,35 +1034,107 @@ def test_rgb_only(resolution='HD720'):
                     print(f"估算 FPS: {retrieve_fps:.1f}")
                 break
 
-        # 测试3: 完整显示
+        # 测试3: 完整显示 - 使用多线程分离捕获和显示
         print(f"\n{'='*60}")
-        print("测试3: 完整流程（含显示）按 'q' 退出")
+        print("测试3: 实时显示 (多线程+ModernGL, 按 'q' 退出)")
         print(f"{'='*60}")
-        frame_count = 0
-        fps_start_time = time.time()
-        current_fps = 0
 
-        while True:
-            frame_dict = cam.get_frame()
+        # 共享数据和锁
+        latest_frame = None
+        latest_frame_lock = threading.Lock()
+        current_capture_fps = 0
+        current_display_fps = 0
+        current_capture_ms = 0
+        current_display_ms = 0
+        stopped = False
 
-            if frame_dict and "left" in frame_dict:
-                frame_count += 1
-                elapsed = time.time() - fps_start_time
+        # 捕获线程函数
+        def capture_thread():
+            nonlocal latest_frame, stopped, current_capture_fps, current_capture_ms
+            capture_count = 0
+            capture_time_total = 0.0
+            fps_start = time.time()
+
+            while not stopped:
+                t0 = time.time()
+                frame_dict = cam.get_frame()
+                t1 = time.time()
+
+                # 更新最新帧
+                if frame_dict and "left" in frame_dict:
+                    with latest_frame_lock:
+                        latest_frame = frame_dict["left"].copy()
+
+                capture_count += 1
+                capture_time_total += (t1 - t0)
+
+                # 统计捕获 FPS
+                elapsed = time.time() - fps_start
                 if elapsed >= 0.5:
-                    current_fps = frame_count / elapsed
-                    frame_count = 0
-                    fps_start_time = time.time()
+                    current_capture_fps = capture_count / elapsed
+                    current_capture_ms = (capture_time_total / capture_count) * 1000 if capture_count > 0 else 0
+                    capture_count = 0
+                    capture_time_total = 0.0
+                    fps_start = time.time()
 
-                left_img = frame_dict["left"].copy()
-                cv2.putText(left_img, f"FPS: {current_fps:.1f} / {max_fps}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(left_img, f"Res: {resolution}", (10, 70),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.imshow("RGB Only", left_img)
+        # 使用 ModernGL 显示
+        display = ModernGLDisplay(width, height, "ZED RGB Only")
+        print("[INFO] 使用 ModernGL 显示 (多线程)")
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
+        # 启动捕获线程
+        cap_thread = threading.Thread(target=capture_thread, daemon=True)
+        cap_thread.start()
+
+        try:
+            display_count = 0
+            display_time_total = 0.0
+            fps_start = time.time()
+
+            while True:
+                # 获取最新帧
+                frame_to_show = None
+                with latest_frame_lock:
+                    if latest_frame is not None:
+                        frame_to_show = latest_frame
+
+                if frame_to_show is not None:
+                    # 显示帧
+                    display_img = frame_to_show.copy()
+                    cv2.putText(display_img, f"Capture: {current_capture_fps:.1f} ({current_capture_ms:.1f}ms) | Display: {current_display_fps:.1f} ({current_display_ms:.1f}ms)", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(display_img, f"Res: {resolution} | Target: {max_fps}", (10, 70),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+                    t0 = time.time()
+                    display.update(display_img)
+                    display.render()
+                    t1 = time.time()
+
+                    display_count += 1
+                    display_time_total += (t1 - t0)
+
+                # 统计显示 FPS
+                elapsed = time.time() - fps_start
+                if elapsed >= 0.5:
+                    current_display_fps = display_count / elapsed
+                    current_display_ms = (display_time_total / display_count) * 1000 if display_count > 0 else 0
+                    display_count = 0
+                    display_time_total = 0.0
+                    fps_start = time.time()
+
+                # 检查按键
+                for key in display.get_pressed_keys():
+                    if key in (glfw.KEY_Q, glfw.KEY_ESCAPE):
+                        stopped = True
+                        break
+                else:
+                    if not display.should_close():
+                        continue
                 break
+        finally:
+            stopped = True
+            cap_thread.join(timeout=1.0)
+            display.close()
 
         print(f"\n{'='*60}")
         print("性能总结:")
@@ -959,29 +1158,30 @@ if __name__ == "__main__":
 
     """
     测试2: 基本相机功能 - 显示图像和打印参数
-    分辨率选项: 'HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA'
+    分辨率选项: 'HD2K', 'HD1080', 'HD720', 'VGA'
     """
-    # test_basic_camera('VGA')    # 672x376 @ 100fps
+    test_basic_camera('VGA')    # 672x376 @ 100fps
     # test_basic_camera('HD720')  # 1280x720 @ 60fps
     # test_basic_camera('HD1080') # 1920x1080 @ 30fps
     # test_basic_camera('HD2K')   # 2208x1242 @ 15fps
 
     """
     测试3: 点云渲染 (需要 Open3D)
-    分辨率选项: 'HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA'
+    分辨率选项: 'HD2K', 'HD1080', 'HD720', 'VGA'
     """
     # test_point_cloud('VGA')
 
     """
     测试4: 拍摄照片用于标定
-    分辨率选项: 'HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA'
+    分辨率选项: 'HD2K', 'HD1080', 'HD720', 'VGA'
     """
     # test_take_photo('HD720')
 
     """
     测试5: RGB-only 性能测试（无深度，最大FPS）
-    分辨率选项: 'HD2K', 'HD1080', 'HD720', 'SVGA', 'VGA'
+    分辨率选项: 'HD2K', 'HD1080', 'HD720', 'VGA'
     """
-    test_rgb_only('VGA')      # 672x376 @ 100fps
+    # test_rgb_only('VGA')      # 672x376 @ 100fps
     # test_rgb_only('HD720')    # 1280x720 @ 60fps
     # test_rgb_only('HD1080')   # 1920x1080 @ 30fps
+    # test_rgb_only('HD2K')     # 2208x1242 @ 15fps
