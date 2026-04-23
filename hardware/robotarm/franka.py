@@ -2,11 +2,140 @@
 pip install franky-control=1.1.1
 """
 import time
+import threading
 from franky import *
 from scipy.spatial.transform import Rotation as R
 import numpy as np
 import math
 from typing import List, Tuple, Optional
+
+class Teleop:
+    """
+    速度控制模式遥操作：
+    每个控制周期计算末端到目标的位置误差，转换为速度指令发出。
+    - 无位置队列积压
+    - 无 stop() 打断
+    - 无加速度不连续 reflex
+    松开 Grip 时 clear_target()，速度自然归零停止。
+    """
+
+    def __init__(self, robot, dynamics_factor=0.5, hz=100):
+        self.robot = robot
+        self._dynamics_factor = dynamics_factor
+        self._hz = hz
+        self._dt_ms = int(1000 / hz)   # Duration 单位是毫秒
+        self._dt_s = 1.0 / hz
+
+        # P 增益：位置误差(m) -> 速度(m/s)，姿态误差(rad) -> 角速度(rad/s)
+        self._kp_pos = 1.0
+        self._kp_rot = 1.0
+        # 放宽速度上限（根据实际需求调整）
+        self._max_vel_pos = 0.5      # m/s，原1.0
+        self._max_vel_rot = 0.5      # rad/s，原1.0
+
+        self._target_affine = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+        self._last_lin_vel = np.zeros(3)
+        self._last_ang_vel = np.zeros(3)
+        self._alpha = 0.3   # 平滑系数，越小越平滑
+
+    def set_target(self, affine):
+        with self._lock:
+            self._target_affine = affine
+
+    def clear_target(self):
+        with self._lock:
+            self._target_affine = None
+
+    def _loop(self):
+        from franky import CartesianVelocityMotion, RobotVelocity, Twist, Duration
+        import time
+
+        # 清错，设置动力学因子
+        try:
+            self.robot.recover_from_errors()
+            time.sleep(0.1)
+        except:
+            pass
+        self.robot.relative_dynamics_factor = self._dynamics_factor
+
+        next_time = time.perf_counter()
+        while self._running:
+            with self._lock:
+                target = self._target_affine
+
+            try:
+                if target is None:
+                    # 零速度指令（异步）
+                    zero_twist = Twist(np.zeros(3), np.zeros(3))
+                    zero_vel = RobotVelocity(zero_twist)
+                    motion = CartesianVelocityMotion(zero_vel, Duration(self._dt_ms),
+                                                    relative_dynamics_factor=self._dynamics_factor)
+                    self.robot.move(motion, asynchronous=True)   # ← 关键修改
+                else:
+                    # 读取当前位姿
+                    ee = self.robot.current_cartesian_state.pose.end_effector_pose
+                    cur_pos = np.array(ee.translation)
+                    cur_quat = np.array(ee.quaternion)
+
+                    tgt_pos = np.array(target.translation)
+                    tgt_quat = np.array(target.quaternion)
+
+                    # 位置误差 -> 线速度
+                    pos_err = tgt_pos - cur_pos
+                    lin_vel = np.clip(pos_err * self._kp_pos, -self._max_vel_pos, self._max_vel_pos)
+
+                    # 姿态误差 -> 角速度
+                    r_cur = R.from_quat(cur_quat)
+                    r_tgt = R.from_quat(tgt_quat)
+                    r_err = r_tgt * r_cur.inv()
+                    rotvec_err = r_err.as_rotvec()
+                    ang_vel = np.clip(rotvec_err * self._kp_rot, -self._max_vel_rot, self._max_vel_rot)
+
+                    twist = Twist(lin_vel, ang_vel)
+                    vel = RobotVelocity(twist)
+                    motion = CartesianVelocityMotion(vel, Duration(self._dt_ms),
+                                                    relative_dynamics_factor=self._dynamics_factor)
+                    self.robot.move(motion, asynchronous=True)   # ← 关键修改
+
+            except Exception as e:
+                if self._running:
+                    print(f"[Teleop] 运动异常: {e}")
+                    try:
+                        self.robot.recover_from_errors()
+                        time.sleep(0.05)
+                    except:
+                        pass
+
+            # 精确计时
+            next_time += self._dt_s
+            sleep_time = next_time - time.perf_counter()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_time = time.perf_counter()
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        ee_pose = self.robot.current_cartesian_state.pose.end_effector_pose
+        self._target_affine = Affine(ee_pose.translation, ee_pose.quaternion)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        print("[Teleop] 速度控制遥操作已启动")
+
+    def stop(self):
+        self._running = False
+        try:
+            self.robot.stop()
+        except Exception:
+            pass
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        print("[Teleop] 已停止")
 
 class FrankaClass:
     """
@@ -72,32 +201,39 @@ class FrankaClass:
             print(f"control_gripper: 控制失败 - {e}")
 
     
-    def control_joint(self, joint_angle: List[float]):
-        """
-        控制关节角度（绝对位置控制）
-        
-        Args:
-            joint_angle: 6个关节角度列表，单位为度（Franka有7个关节，这里使用前6个或补全）
-        """
-        # 转换为弧度
-        if len(joint_angle) == 6:
-            # 如果提供6个关节，补充第7个关节为当前值或默认值
-            q_rad = list(np.radians(joint_angle))
-            # 获取当前第7关节角度或设为0
-            try:
-                current_q = self.robot.current_joint_state.position
-                q7 = current_q[6] if len(current_q) >= 7 else 0.7
-            except:
-                q7 = 0.7  # 默认安全值
-            q_rad.append(q7)
-        elif len(joint_angle) == 7:
-            q_rad = list(np.radians(joint_angle))
-        else:
-            raise ValueError(f"joint_angle必须是6或7个关节角度，当前{len(joint_angle)}个")
-        
-        # 执行关节运动
-        motion = JointMotion(q_rad)
-        self.robot.move(motion)
+    def control_joint(self, joint_angle: List[float], angle_type: str = "degree"):
+            """
+            控制关节角度（绝对位置控制）
+
+            Args:
+                joint_angle: 6个或7个关节角度列表
+                angle_type: 角度单位，"degree"（默认，角度制）或 "radian"（弧度制）
+            """
+            # 验证angle_type参数
+            if angle_type not in ["degree", "radian"]:
+                raise ValueError(f'angle_type必须是"degree"或"radian"，当前为"{angle_type}"')
+
+            # 根据输入单位转换为弧度
+            if angle_type == "degree":
+                q_input = list(np.radians(joint_angle))
+            else:  # radian
+                q_input = list(joint_angle)
+
+            # 处理6个或7个关节的情况
+            if len(joint_angle) == 6:
+                # 如果提供6个关节，补充第7个关节为当前值或默认值
+                try:
+                    current_q = self.robot.current_joint_state.position
+                    q7 = current_q[6] if len(current_q) >= 7 else 0.7
+                except:
+                    q7 = 0.7  # 默认安全值
+                q_input.append(q7)
+            elif len(joint_angle) != 7:
+                raise ValueError(f"joint_angle必须是6或7个关节角度，当前{len(joint_angle)}个")
+
+            # 执行关节运动
+            motion = JointMotion(q_input)
+            self.robot.move(motion)
     
     def getpose(self) -> dict:
         """
@@ -139,16 +275,21 @@ class FrankaClass:
     
 
     def disable(self):
-        """
-        停止机器人并进入空闲状态（Franka没有Piper那样的"失能"概念，使用停止运动代替）
-        """
+        """停止机器人（兼容 reflex 保护状态）"""
         try:
-            # 发送停止命令
-            stop_motion = CartesianStopMotion()
-            self.robot.move(stop_motion)
-            print("disable: 机器人已停止运动")
-        except Exception as e:
-            print(f"disable: 停止失败 - {e}")
+            # 优先尝试直接 stop（reflex 状态下也有效）
+            self.robot.stop()
+            print("disable: 机器人已停止 (stop)")
+        except Exception:
+            try:
+                # stop 不可用时，尝试 recover 清除 reflex 再 stop
+                self.robot.recover()
+                time.sleep(0.5)
+                self.robot.stop()
+                print("disable: 机器人已恢复并停止 (recover + stop)")
+            except Exception as e2:
+                print(f"disable: 停止失败（可能需要手动解锁）- {e2}")
+
     
 
         
@@ -379,61 +520,88 @@ class FrankaClass:
             print(f"inverse_kinematics: 求解失败 - {e}")
             return None
     
-    # ==================== Franka特有扩展方法 ====================
-
-    def move_cartesian(self, position: List[float], orientation: Optional[List[float]] = None, 
-                    relative: bool = False, relative_dynamics: float = 0.1):
+    def start_teleop(self, dynamics_factor: float = 0.08):
         """
-        笛卡尔空间运动，内部自动插值路径点
+        启动遥操作模式：后台线程持续以低动力学因子执行 CartesianMotion。
 
         Args:
-            position: [x, y, z] 目标位置（绝对：米，相对：毫米）
-            orientation: 四元数[x, y, z, w]或欧拉角[rx, ry, rz]（度）
-            relative: 是否相对运动
-            relative_dynamics: 动力学缩放因子
+            dynamics_factor: 相对动力学因子 (0-1)，越低越慢越柔顺，默认0.08
+        Returns:
+            Teleop 实例，用于 set_target / stop
         """
-        from franky import Affine, CartesianWaypointMotion, CartesianWaypoint, ReferenceType, RelativeDynamicsFactor
+        teleop = Teleop(self.robot, dynamics_factor)
+        teleop.start()
+        return teleop
 
-        # 处理目标位置
-        if relative:
-            target_pos = [p / 1000.0 for p in position]  # 毫米转米
+    def move_cartesian(self, position: Optional[List[float]] = None,
+                        orientation: Optional[List[float]] = None,
+                        relative: bool = False, relative_dynamics: float = 0.1):
+        """
+        笛卡尔空间运动
+        
+        Args:
+            position: [x, y, z] 目标位置
+                - relative=True 时：单位 mm（偏移量），None=不移动
+                - relative=False 时：单位 m（绝对位置），None=保持当前位置
+            orientation: 四元数[x,y,z,w] 或 欧拉角[rx,ry,rz]（度），None=保持当前姿态
+            relative: 是否相对运动
+            relative_dynamics: 动力学缩放因子(0-1)
+        """
+        from franky import Affine, CartesianMotion
+        
+        # ---- 1. 获取当前状态 ----
+        current_state = self.robot.current_cartesian_state
+        ee_affine = current_state.pose.end_effector_pose
+        current_pos = list(ee_affine.translation)       # [x, y, z] 米
+        current_quat = list(ee_affine.quaternion)       # [x, y, z, w]
+        
+        # ---- 2. 计算目标位置（始终转为绝对坐标） ----
+        if position is None:
+            target_pos = current_pos                     # 保持当前位置
+        elif relative:
+            offset_m = [p / 1000.0 for p in position]   # mm → m
+            target_pos = [current_pos[i] + offset_m[i] for i in range(3)]
+            print(f"  相对偏移: {position} mm → 绝对目标(m): {[round(v, 4) for v in target_pos]}")
         else:
-            target_pos = position
-
-        # 处理目标姿态
+            target_pos = list(position)
+        
+        # ---- 3. 计算目标姿态 ----
         if orientation is None:
-            # 保持当前姿态
-            current_state = self.robot.current_cartesian_state()
-            target_quat = [
-                current_state.orientation.x,
-                current_state.orientation.y, 
-                current_state.orientation.z,
-                current_state.orientation.w
-            ]
-        else:
-            if len(orientation) == 3:
-                target_quat = R.from_euler('xyz', orientation, degrees=True).as_quat()
+            target_quat = current_quat
+        elif len(orientation) == 3:
+            if relative:
+                # 相对模式：将欧拉角增量叠加到当前姿态
+                current_euler = R.from_quat(current_quat).as_euler('xyz', degrees=True)
+                target_euler = [current_euler[i] + orientation[i] for i in range(3)]
+                target_quat = list(R.from_euler('xyz', target_euler, degrees=True).as_quat())
+                print(f"  相对旋转: {orientation} ° → 绝对姿态(°): {[round(v, 2) for v in target_euler]}")
             else:
-                target_quat = orientation
-
-        # 构建目标 Affine
-        ref_type = ReferenceType.Relative if relative else ReferenceType.Absolute
+                target_quat = list(R.from_euler('xyz', orientation, degrees=True).as_quat())
+        else:
+            if relative:
+                # 四元数增量模式：将增量旋转叠加到当前姿态
+                current_rot = R.from_quat(current_quat)
+                delta_rot = R.from_quat(orientation)
+                target_quat = list((delta_rot * current_rot).as_quat())
+            else:
+                target_quat = list(orientation)
+        
+        # ---- 4. 构建 Affine 并执行 ----
         target_affine = Affine(target_pos, target_quat)
+        
+        old_dynamics = self.robot.relative_dynamics_factor
+        self.robot.relative_dynamics_factor = relative_dynamics
+        
+        try:
+            motion = CartesianMotion(target_affine)
+            self.robot.move(motion)
+            print(f"  ✅ 运动完成")
+        except Exception as e:
+            print(f"  ❌ 笛卡尔运动失败: {e}")
+        finally:
+            self.robot.relative_dynamics_factor = old_dynamics
 
-        # 创建路径点（注意是 CartesianWaypoint，不是 Waypoint）
-        waypoint = CartesianWaypoint(
-            target_affine,
-            ref_type,
-            RelativeDynamicsFactor(relative_dynamics)
-        )
 
-        # 创建路径点运动
-        motion = CartesianWaypointMotion(
-            [waypoint],  # 路径点列表
-            relative_dynamics_factor=relative_dynamics  # 全局动力学因子
-        )
-
-        self.robot.move(motion)
 
     def get_current_pose_euler(self) -> List[float]:
         """
@@ -449,13 +617,10 @@ class FrankaClass:
 # ==================== 使用示例 ====================
 
 if __name__ == "__main__":
-    # """
-    # 获取机械臂位姿示例
-    # """
-    # 初始化（替换为你的Franka IP）
-    # franka = FrankaClass(ip_address="172.16.0.2", dynamics_factor=0.1)
-    
-    
+    """
+    获取机械臂位姿示例
+    """
+    # franka = FrankaClass(ip_address="172.16.0.2", dynamics_factor=0.1) 
     # try:
     #     while True:
     #         pose_dict = franka.getpose()
@@ -471,26 +636,26 @@ if __name__ == "__main__":
     """
     控制夹爪开合
     """
-    franka = FrankaClass("172.16.0.2", 0.1)
+    # franka = FrankaClass("172.16.0.2", 0.1)
 
-    # 打开到 80mm
-    franka.control_gripper(80)
-    time.sleep(1)
+    # # 打开到 80mm
+    # franka.control_gripper(80)
+    # time.sleep(1)
 
-    # 闭合到 10mm
-    franka.control_gripper(10)
-    time.sleep(1)
+    # # 闭合到 10mm
+    # franka.control_gripper(10)
+    # time.sleep(1)
 
-    # 完全闭合
-    franka.control_gripper(0)
+    # # 完全闭合
+    # franka.control_gripper(0)
     """
     运动学检查
     """
     # franka = FrankaClass("172.16.0.2", 0.1)
-    # q_test = [0, -45, 0, -135, 0, 90, 45]
+    # q_test = [-0.0, 0.0, 0.0, -2.0, 0.0, 1.8, 0.7]
     
     # # 运动到测试位姿
-    # franka.control_joint(q_test)
+    # franka.control_joint(q_test,angle_type = "radian")
     # time.sleep(2)
 
     # # 1. 机器人真实读数
@@ -499,10 +664,10 @@ if __name__ == "__main__":
     # print("【机器人真实位姿】\n", real)
 
     # # 2. DH正运动学计算
-    # calc = FrankaClass.forward_kinematics(q_test, format="euler")
+    # calc = FrankaClass.forward_kinematics(np.rad2deg(q_test), format="euler")
     # print("【DH计算位姿】\n", calc)
 
-    # 3. 误差
+    # # 3. 误差
     # err = np.abs(np.array(real[:3]) - np.array(calc[:3]))
     # print(f"【位置误差】X: {err[0]:.2f}mm Y: {err[1]:.2f}mm Z: {err[2]:.2f}mm")
     # # 检查旋转矩阵是否相同（这才是金标准）
@@ -514,18 +679,6 @@ if __name__ == "__main__":
 
     # # 比较旋转矩阵
     # print("旋转矩阵差:\n", calc_T[:3,:3] - real_R)
-    """
-    打印位姿
-    """
-    # # 初始化（替换为你的Franka IP）
-    # franka = FrankaClass(ip_address="172.16.0.2", dynamics_factor=0.1)
-    
-    # # 可选：移动到安全姿态
-    # q_safe = [0.0, -45.0, 0.0, -125.0, 0.0, 90.0, 40.0]  # 度
-    # franka.control_joint(q_safe)
-
-    # franka.disable()
-    # print("程序已退出")
     """
     新增：纯前向运动学（正解）测试代码
     输入7个关节角度 → 输出末端位姿（mm + deg）
@@ -614,3 +767,144 @@ if __name__ == "__main__":
 
     # franka.disable()
     # print("\n✅ 测试完成，程序退出")
+    """
+    相对位置控制模式测试,沿着x,y,z方向分别前进后退20mm,rxryrz分别旋转15度并转回
+    """
+    # franka = FrankaClass(ip_address="172.16.0.2", dynamics_factor=0.1)
+
+    # try:
+    #     print("=" * 60)
+    #     print("【 相对位置控制模式测试 】")
+    #     print("=" * 60)
+
+    #     # 获取初始位姿
+    #     initial_pose = franka.get_current_pose_euler()
+    #     print(f"\n初始位姿: {[round(v, 2) for v in initial_pose]}")
+
+    #     # 测试参数
+    #     translation_dist = 20.0  # 平移距离 mm
+    #     rotation_angle = 10.0    # 旋转角度 deg
+    #     wait_time = 2.0          # 等待时间 s
+
+    #     # 轴名称
+    #     axes = ['X', 'Y', 'Z']
+    #     rot_axes = ['RX', 'RY', 'RZ']
+
+    #     # ==================== 平移测试 ====================
+    #     print("\n" + "-" * 60)
+    #     print("【 平移测试 】")
+    #     print("-" * 60)
+
+    #     for i, axis in enumerate(axes):
+    #         print(f"\n--- {axis} 轴测试 ---")
+
+    #         # 正向移动
+    #         delta = [0.0, 0.0, 0.0]
+    #         delta[i] = translation_dist
+    #         print(f"正向移动 {translation_dist}mm...")
+    #         franka.move_cartesian(delta, relative=True)
+    #         time.sleep(wait_time)
+
+    #         # 获取当前位姿
+    #         current_pose = franka.get_current_pose_euler()
+    #         print(f"当前位姿: {[round(v, 2) for v in current_pose]}")
+
+    #         # 反向移动（回到原位）
+    #         delta[i] = -translation_dist
+    #         print(f"反向移动 {translation_dist}mm...")
+    #         franka.move_cartesian(delta, relative=True)
+    #         time.sleep(wait_time)
+
+    #         # 获取当前位姿
+    #         current_pose = franka.get_current_pose_euler()
+    #         print(f"当前位姿: {[round(v, 2) for v in current_pose]}")
+
+    #     # ==================== 旋转测试 ====================
+    #     print("\n" + "-" * 60)
+    #     print("【 旋转测试 】")
+    #     print("-" * 60)  # 正确
+
+    #     for i, axis in enumerate(rot_axes):
+    #         print(f"\n--- {axis} 轴测试 ---")
+
+    #         # 获取当前姿态
+    #         current_pose = franka.get_current_pose_euler()
+    #         current_ori = current_pose[3:]  # [rx, ry, rz]
+
+    #         # ✅ 正向旋转：position=None 保持当前位置
+    #         target_ori = current_ori.copy()
+    #         target_ori[i] += rotation_angle
+    #         print(f"正向旋转 {rotation_angle}°...")
+    #         franka.move_cartesian(position=None, orientation=target_ori, relative=False)
+    #         time.sleep(wait_time)
+
+    #         current_pose = franka.get_current_pose_euler()
+    #         print(f"当前位姿: {[round(v, 2) for v in current_pose]}")
+
+    #         # ✅ 反向旋转：回到旋转前的姿态
+    #         target_ori_back = current_ori.copy()   # 旋转前的姿态
+    #         print(f"反向旋转 {rotation_angle}°...")
+    #         franka.move_cartesian(position=None, orientation=target_ori_back, relative=False)
+    #         time.sleep(wait_time)
+
+    #         current_pose = franka.get_current_pose_euler()
+    #         print(f"当前位姿: {[round(v, 2) for v in current_pose]}")
+
+
+    #     # ==================== 组合测试 ====================
+    #     print("\n" + "-" * 60)
+    #     print("【 组合运动测试 】")
+    #     print("-" * 60)
+
+    #     print("\n同时移动 X+10mm, Y+10mm, Z+10mm...")
+    #     franka.move_cartesian([10, 10, 10], relative=True)
+    #     time.sleep(wait_time)
+    #     current_pose = franka.get_current_pose_euler()
+    #     print(f"当前位姿: {[round(v, 2) for v in current_pose]}")
+
+    #     print("\n同时移回 X-10mm, Y-10mm, Z-10mm...")
+    #     franka.move_cartesian([-10, -10, -10], relative=True)
+    #     time.sleep(wait_time)
+    #     current_pose = franka.get_current_pose_euler()
+    #     print(f"当前位姿: {[round(v, 2) for v in current_pose]}")
+
+    #     print("\n" + "=" * 60)
+    #     print("✅ 相对位置控制测试完成")
+    #     print("=" * 60)
+
+    # except KeyboardInterrupt:
+    #     print("\n测试被用户中断")
+    # except Exception as e:
+    #     print(f"\n测试出错: {e}")
+    # finally:
+    #     franka.disable()
+    #     print("\n程序已退出")
+    """
+    resetfranka
+    """
+    franka = FrankaClass(ip_address="172.16.0.2", dynamics_factor=0.1)
+
+    # 安全姿态（弧度转角度）
+    q_safe_rad = [-0.0, 0.0, 0.0, -2.0, 0.0, 1.8, 0.7]
+    q_safe_deg = np.degrees(q_safe_rad).tolist()  # 安全姿态示例（避免奇异）
+    franka.control_joint(q_safe_deg)
+
+    def get_current_pose():
+        pose_dict = franka.getpose()
+        pos_mm = pose_dict["end_pose"][:3]  # [x,y,z] mm
+        rpy_deg = pose_dict["end_pose"][3:]  # [rx,ry,rz] deg
+        joint_deg = pose_dict["joint_state"]  # 7关节角度 deg
+
+        # 转换为米（与原代码一致）
+        pos_m = [p / 1000.0 for p in pos_mm]
+
+        print("pos:", pos_m)
+        # 从欧拉角转回四元数（与原代码输出格式一致）
+        quat = R.from_euler('xyz', rpy_deg, degrees=True).as_quat()  # [x,y,z,w]
+        print("cur_quat:", quat)
+        print("rpy_deg:", rpy_deg)
+        print('-'*40)
+
+    get_current_pose()
+
+    franka.disable()
